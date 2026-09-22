@@ -41,7 +41,7 @@ class ConfidenceAwareViewAttention(nn.Module):
             nn.Linear(repr_dim, repr_dim),
         )
 
-    def forward(self, view_feats, camera_ids=None, view_confidence=None):
+    def forward(self, view_feats, camera_ids=None, view_confidence=None, front_valid=None):
         fused_feats, pooled_feats, attn_weights = [], [], []
         for stage_idx, feat in enumerate(view_feats):
             B, T, V, C, H, W = feat.shape
@@ -62,6 +62,9 @@ class ConfidenceAwareViewAttention(nn.Module):
             if view_confidence is not None:
                 conf = view_confidence.to(feat.device).float().clamp_min(1e-6)
                 score = score + conf.log()
+            if front_valid is not None:
+                valid = front_valid.to(feat.device).bool()
+                score = score.masked_fill(~valid, -1e9)
             weights = torch.softmax(score, dim=-1)
             fused = (feat * weights[..., None, None, None]).sum(dim=2)
 
@@ -95,12 +98,39 @@ class FrontCameraTeacher(nn.Module):
             max_cameras=max_cameras,
         )
 
-    def forward(self, front_images, camera_ids=None, view_confidence=None):
+    def forward(self, front_images, camera_ids=None, view_confidence=None, front_valid=None):
         B, T, V, C, H, W = front_images.shape
         images = front_images.reshape(B * T * V, C, H, W)
         encoded = self.encoder(images)
         view_feats = [f.view(B, T, V, *f.shape[1:]) for f in encoded]
-        return self.fusion(view_feats, camera_ids=camera_ids, view_confidence=view_confidence)
+        return self.fusion(
+            view_feats,
+            camera_ids=camera_ids,
+            view_confidence=view_confidence,
+            front_valid=front_valid,
+        )
+
+
+class TeacherPoseHead(nn.Module):
+    def __init__(self, repr_dim=256, keypoint_dim=3, num_joints=21, dropout=0.1):
+        super().__init__()
+        self.keypoint_dim = keypoint_dim
+        self.num_joints = num_joints
+        self.head = nn.Sequential(
+            nn.Linear(repr_dim, repr_dim),
+            nn.LayerNorm(repr_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(repr_dim, 2 * num_joints * keypoint_dim),
+        )
+
+    def forward(self, teacher_repr):
+        B, T, _ = teacher_repr.shape
+        pred = self.head(teacher_repr).view(B, T, 2, self.num_joints, self.keypoint_dim)
+        return {
+            "teacher_left_joints": pred[:, :, 0],
+            "teacher_right_joints": pred[:, :, 1],
+        }
 
 
 class StudentTeacherProjection(nn.Module):

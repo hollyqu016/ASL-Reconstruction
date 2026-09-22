@@ -1,3 +1,4 @@
+import argparse
 import glob
 import os
 import random
@@ -10,11 +11,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from datasets.aslhand2_front import ASLHand2FrontDataset, default_aslhand2_roots
 from datasets.hot3d import StructSyncClipDataset
 from evaluator import PoseEvaluator
 from loss import StructureLatentLoss, TeacherDistillationLoss
 from models.DualSwinFeatureExtractor import DualSwinFPN
-from models.FrontTeacher import FrontCameraTeacher, StudentTeacherProjection
+from models.FrontTeacher import FrontCameraTeacher, StudentTeacherProjection, TeacherPoseHead
 from models.LatentProcessingModule import LatentProcessingModule
 from models.MANODecoder import Decoder
 from models.MultiScaleCrossViewFusion import MultiScaleCrossViewFusion
@@ -44,6 +46,8 @@ front_img_size = int(os.environ.get("FRONT_IMG_SIZE", img_size))
 use_front_teacher = os.environ.get("USE_FRONT_TEACHER", "1") == "1"
 front_in_chans = int(os.environ.get("FRONT_IN_CHANS", 3))
 front_max_cameras = int(os.environ.get("FRONT_MAX_CAMERAS", 8))
+teacher_ckpt_name = os.environ.get("FRONT_TEACHER_CKPT", "front_teacher_best.pth")
+lambda_velocity = float(os.environ.get("LAMBDA_VELOCITY", 0.05))
 seed = 42
 
 IMG_MEAN, IMG_STD = 0.449, 0.226
@@ -126,7 +130,7 @@ def first_existing(batch, names):
 
 
 def get_front_images(batch, device):
-    front = first_existing(batch, ("front_img_clip", "front_imgs_clip", "front_images_clip", "front_rgb_clip"))
+    front = first_existing(batch, ("front_img_clip", "front_imgs_clip", "front_images_clip", "front_rgb_clip", "front_rgb"))
     if front is None:
         return None
     if isinstance(front, (list, tuple)):
@@ -135,6 +139,13 @@ def get_front_images(batch, device):
     if front.dim() != 6:
         raise ValueError(f"Front images must have shape [B,T,V,C,H,W], got {tuple(front.shape)}")
     return preprocess_front_images(front)
+
+
+def get_front_valid(batch, device):
+    valid = first_existing(batch, ("front_valid", "front_valid_clip"))
+    if valid is None:
+        return None
+    return valid.to(device).bool()
 
 
 def get_optional_tensor(batch, names, device, dtype=torch.float32):
@@ -190,6 +201,37 @@ def get_front_pose_pseudo(batch, device):
     return triangulate_points_dlt(pts_r, conf_r, K, E), triangulate_points_dlt(pts_l, conf_l, K, E)
 
 
+def get_front_gt_keypoints(batch, device):
+    left = get_optional_tensor(batch, ("front_left_keypoints", "front_left_keypoints_clip"), device)
+    right = get_optional_tensor(batch, ("front_right_keypoints", "front_right_keypoints_clip"), device)
+    if left is None or right is None:
+        return None, None, None, None
+    left_conf = get_optional_tensor(batch, ("front_left_confidence", "front_left_confidence_clip"), device)
+    right_conf = get_optional_tensor(batch, ("front_right_confidence", "front_right_confidence_clip"), device)
+    if left_conf is None:
+        left_conf = torch.ones(left.shape[:-1], device=device)
+    if right_conf is None:
+        right_conf = torch.ones(right.shape[:-1], device=device)
+    return left.float(), right.float(), left_conf.float(), right_conf.float()
+
+
+def keypoint_loss(pred, gt, conf=None):
+    loss = F.smooth_l1_loss(pred, gt, reduction="none").mean(dim=-1)
+    if conf is None:
+        return loss.mean()
+    weight = conf.clamp_min(0.0)
+    return (loss * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def velocity_loss(pred, gt, conf=None):
+    if pred.shape[1] < 2:
+        return pred.new_tensor(0.0)
+    pred_vel = pred[:, 1:] - pred[:, :-1]
+    gt_vel = gt[:, 1:] - gt[:, :-1]
+    vel_conf = None if conf is None else torch.minimum(conf[:, 1:], conf[:, :-1])
+    return keypoint_loss(pred_vel, gt_vel, vel_conf)
+
+
 def forward_model(batch, device, dual_swin, fusion, latent, decoder, front_teacher=None, student_proj=None):
     left, right = batch["left_img_clip"].to(device), batch["right_img_clip"].to(device)
     K_left, _, K_left_inv, T_left2right = build_camera_matrices(batch, device)
@@ -210,12 +252,9 @@ def forward_model(batch, device, dual_swin, fusion, latent, decoder, front_teach
         if front_images is not None:
             camera_ids = get_optional_tensor(batch, ("front_camera_ids", "front_camera_ids_clip"), device, dtype=torch.long)
             view_conf = get_optional_tensor(batch, ("front_view_confidence_clip", "front_confidence_clip"), device)
-            teacher_out = front_teacher(front_images, camera_ids=camera_ids, view_confidence=view_conf)
+            front_valid = get_front_valid(batch, device)
+            teacher_out = front_teacher(front_images, camera_ids=camera_ids, view_confidence=view_conf, front_valid=front_valid)
             teacher_out["student_repr"] = student_proj(aux)
-            pseudo_r, pseudo_l = get_front_pose_pseudo(batch, device)
-            if pseudo_r is not None and pseudo_l is not None:
-                teacher_out["pseudo_r"] = to_relative(pseudo_r.float())
-                teacher_out["pseudo_l"] = to_relative(pseudo_l.float())
 
     return to_relative(j_r), to_relative(j_l), r_gt, l_gt, aux, teacher_out
 
@@ -224,39 +263,61 @@ def unwrap(module):
     return module.module if hasattr(module, "module") else module
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_mode", choices=("baseline", "student", "teacher"), default=os.environ.get("TRAIN_MODE", "baseline"))
+    parser.add_argument("--data_train", default=data_tar_train)
+    parser.add_argument("--data_val", default=data_tar_val)
+    parser.add_argument("--aslhand2_keypoint_root", default=default_aslhand2_roots()["keypoint_root"])
+    parser.add_argument("--aslhand2_zed_root", default=default_aslhand2_roots()["zed_root"])
+    parser.add_argument("--aslhand2_sequence", default=os.environ.get("ASLHAND2_SEQUENCE", "Abdul_03_52"))
+    parser.add_argument("--teacher_ckpt", default=os.path.join(save_dir, teacher_ckpt_name))
+    parser.add_argument("--lambda_distill", type=float, default=lambda_distill)
+    parser.add_argument("--lambda_velocity", type=float, default=lambda_velocity)
+    parser.add_argument("--num_epochs", type=int, default=num_epochs)
+    parser.add_argument("--batch_size", type=int, default=batch_size)
+    parser.add_argument("--num_workers", type=int, default=num_workers)
+    parser.add_argument("--clip_len", type=int, default=clip_len)
+    parser.add_argument("--smoke", action="store_true")
+    return parser.parse_args()
+
+
 def train_one_epoch(train_loader, device, dual_swin, fusion, latent, decoder, front_teacher, student_proj, loss_module, distill_loss_module, optimizer, evaluator, writer, global_step):
-    for m in (dual_swin, fusion, latent, decoder, front_teacher, student_proj):
+    for m in (dual_swin, fusion, latent, decoder, student_proj):
         if m is None:
             continue
         m.train()
+    if front_teacher is not None:
+        front_teacher.eval()
     mpjpe_r_all, mpjpe_l_all = [], []
     pbar = tqdm(train_loader, desc="Training", dynamic_ncols=True, mininterval=30)
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         lambda_kl = linear_schedule(global_step, 0.0, kl_max, kl_anneal_steps)
         unwrap(latent).tau = linear_schedule(global_step, 2.0, 0.5, tau_anneal_steps)
         optimizer.zero_grad()
         j_r, j_l, r_gt, l_gt, aux, teacher_out = forward_model(batch, device, dual_swin, fusion, latent, decoder, front_teacher, student_proj)
         pose_loss = ((j_r - r_gt).norm(dim=-1).mean() + (j_l - l_gt).norm(dim=-1).mean()) * 1000.0 / 2
         latent_loss, loss_dict = loss_module(aux, lambda_kl)
-        teacher_pose_loss = j_r.new_tensor(0.0)
         distill_loss = j_r.new_tensor(0.0)
         if teacher_out is not None:
             distill_loss = distill_loss_module(teacher_out["student_repr"], teacher_out["teacher_repr"])
-            if "pseudo_r" in teacher_out and "pseudo_l" in teacher_out:
-                teacher_pose_loss = (
-                    (j_r - teacher_out["pseudo_r"].detach()).norm(dim=-1).mean()
-                    + (j_l - teacher_out["pseudo_l"].detach()).norm(dim=-1).mean()
-                ) * 1000.0 / 2
-        total_loss = lambda_pose * pose_loss + latent_loss + lambda_teacher_pose * teacher_pose_loss + lambda_distill * distill_loss
+        total_loss = lambda_pose * pose_loss + latent_loss + lambda_distill * distill_loss
         total_loss.backward()
         optimizer.step()
         metrics = evaluator.evaluate(j_r, j_l, r_gt, l_gt)
+        if batch_idx == 0:
+            print("First student/baseline batch shapes:")
+            print(f"  student predicted right/left joints: {tuple(j_r.shape)} / {tuple(j_l.shape)}")
+            print(f"  GT right/left joints: {tuple(r_gt.shape)} / {tuple(l_gt.shape)}")
+            print(f"  student_repr(mu_L/mu_R): {tuple(aux['mu_L'].shape)} / {tuple(aux['mu_R'].shape)}")
+            if teacher_out is not None:
+                print(f"  teacher_repr: {tuple(teacher_out['teacher_repr'].shape)}")
+                print(f"  student_projected_repr: {tuple(teacher_out['student_repr'].shape)}")
         if writer:
             for k, v in metrics.items():
                 writer.add_scalar(f"Metrics/{k}", v, global_step)
             writer.add_scalar("Loss/Total", total_loss.item(), global_step)
             writer.add_scalar("Loss/Joint", pose_loss.item(), global_step)
-            writer.add_scalar("Loss/TeacherPose", teacher_pose_loss.item(), global_step)
             writer.add_scalar("Loss/Distill", distill_loss.item(), global_step)
             for k, v in loss_dict.items():
                 writer.add_scalar(f"Loss/{k}", v, global_step)
@@ -266,6 +327,47 @@ def train_one_epoch(train_loader, device, dual_swin, fusion, latent, decoder, fr
         mpjpe_l_all.append(metrics["MPJPE_L"])
         global_step += 1
     return (np.mean(mpjpe_r_all) + np.mean(mpjpe_l_all)) / 2, global_step
+
+
+def train_teacher_one_epoch(loader, device, front_teacher, teacher_pose_head, optimizer, writer, global_step):
+    front_teacher.train()
+    teacher_pose_head.train()
+    losses = []
+    pbar = tqdm(loader, desc="Teacher training", dynamic_ncols=True, mininterval=30)
+    for batch_idx, batch in enumerate(pbar):
+        front_rgb = get_front_images(batch, device)
+        front_valid = get_front_valid(batch, device)
+        left_gt, right_gt, left_conf, right_conf = get_front_gt_keypoints(batch, device)
+        if front_rgb is None or left_gt is None or right_gt is None:
+            raise RuntimeError("Teacher mode requires front_rgb/front keypoints in the batch.")
+
+        optimizer.zero_grad()
+        teacher_out = front_teacher(front_rgb, front_valid=front_valid)
+        pose_out = teacher_pose_head(teacher_out["teacher_repr"])
+        left_pred = pose_out["teacher_left_joints"]
+        right_pred = pose_out["teacher_right_joints"]
+        pose_loss = keypoint_loss(left_pred, left_gt, left_conf) + keypoint_loss(right_pred, right_gt, right_conf)
+        vel_loss = velocity_loss(left_pred, left_gt, left_conf) + velocity_loss(right_pred, right_gt, right_conf)
+        total_loss = pose_loss + lambda_velocity * vel_loss
+        total_loss.backward()
+        optimizer.step()
+
+        if batch_idx == 0:
+            print("First teacher batch shapes:")
+            print(f"  front_rgb: {tuple(front_rgb.shape)}")
+            print(f"  teacher_repr: {tuple(teacher_out['teacher_repr'].shape)}")
+            print(f"  teacher_left_joints: {tuple(left_pred.shape)}")
+            print(f"  teacher_right_joints: {tuple(right_pred.shape)}")
+            print(f"  GT left/right: {tuple(left_gt.shape)} / {tuple(right_gt.shape)}")
+            print(f"  detected keypoints: {left_gt.shape[-1]}D")
+        if writer:
+            writer.add_scalar("Teacher/L_pose", pose_loss.item(), global_step)
+            writer.add_scalar("Teacher/L_velocity", vel_loss.item(), global_step)
+            writer.add_scalar("Teacher/L_total", total_loss.item(), global_step)
+        losses.append(total_loss.item())
+        pbar.set_postfix({"teacher_pose": pose_loss.item(), "teacher_total": total_loss.item()})
+        global_step += 1
+    return float(np.mean(losses)), global_step
 
 
 @torch.no_grad()
@@ -283,30 +385,78 @@ def run_evaluation(val_loader, device, dual_swin, fusion, latent, decoder, evalu
 
 
 def main():
+    global lambda_distill, lambda_velocity
+    args = parse_args()
+    lambda_distill = args.lambda_distill
+    lambda_velocity = args.lambda_velocity
     set_seed(seed)
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     writer = SummaryWriter(log_dir=log_dir)
     os.makedirs(save_dir, exist_ok=True)
 
-    train_tars, val_tars = glob_tars(data_tar_train), glob_tars(data_tar_val)
-    train_set = StructSyncClipDataset(train_tars, clip_len=clip_len, stride=stride, crop_hands=crop_hands, crop_size=img_size)
-    val_set = StructSyncClipDataset(val_tars, clip_len=clip_len, stride=clip_len, crop_hands=crop_hands, crop_size=img_size)
-    n_shards = lambda tars: len(tars) if isinstance(tars, list) else num_workers
-    train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=min(num_workers, n_shards(train_tars)))
-    val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=min(num_workers, n_shards(val_tars)))
+    if args.train_mode == "teacher":
+        train_set = ASLHand2FrontDataset(
+            args.aslhand2_keypoint_root,
+            args.aslhand2_zed_root,
+            sequence_id=args.aslhand2_sequence,
+            clip_len=args.clip_len,
+            stride=stride,
+            image_size=front_img_size,
+        )
+        if args.smoke:
+            train_set.starts = train_set.starts[:1]
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, num_workers=args.num_workers)
+        front_teacher = FrontCameraTeacher(in_chans=front_in_chans, max_cameras=front_max_cameras).to(device)
+        teacher_pose_head = TeacherPoseHead(keypoint_dim=train_set.keypoint_dim).to(device)
+        optimizer = Adam(list(front_teacher.parameters()) + list(teacher_pose_head.parameters()), lr=lr)
+        global_step, best_loss = 0, float("inf")
+        for epoch in range(1, args.num_epochs + 1):
+            print(f"\n=== Teacher Epoch {epoch} ===")
+            mean_loss, global_step = train_teacher_one_epoch(train_loader, device, front_teacher, teacher_pose_head, optimizer, writer, global_step)
+            ckpt = {
+                "epoch": epoch,
+                "keypoint_dim": train_set.keypoint_dim,
+                "front_teacher": front_teacher.state_dict(),
+                "teacher_pose_head": teacher_pose_head.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }
+            torch.save(ckpt, os.path.join(save_dir, "front_teacher_last.pth"))
+            if mean_loss < best_loss:
+                best_loss = mean_loss
+                torch.save(ckpt, args.teacher_ckpt)
+                print(f"New best teacher loss {best_loss:.6f} -> {args.teacher_ckpt}")
+            if args.smoke:
+                break
+        return
 
-    dual_swin = torch.nn.DataParallel(DualSwinFPN().to(device))
-    fusion = torch.nn.DataParallel(MultiScaleCrossViewFusion(stages=4, dim=128, pe_feats=32, heads=4).to(device))
-    latent = torch.nn.DataParallel(LatentProcessingModule(seq_len=clip_len).to(device))
-    decoder = torch.nn.DataParallel(Decoder(mano_path).to(device))
+    train_tars, val_tars = glob_tars(args.data_train), glob_tars(args.data_val)
+    train_set = StructSyncClipDataset(train_tars, clip_len=args.clip_len, stride=stride, crop_hands=crop_hands, crop_size=img_size)
+    val_set = StructSyncClipDataset(val_tars, clip_len=args.clip_len, stride=args.clip_len, crop_hands=crop_hands, crop_size=img_size)
+    n_shards = lambda tars: len(tars) if isinstance(tars, list) else args.num_workers
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, num_workers=min(args.num_workers, n_shards(train_tars)))
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, num_workers=min(args.num_workers, n_shards(val_tars)))
+
+    dual_swin = torch.nn.DataParallel(DualSwinFPN().to(device)) if device.type == "cuda" else DualSwinFPN().to(device)
+    fusion = torch.nn.DataParallel(MultiScaleCrossViewFusion(stages=4, dim=128, pe_feats=32, heads=4).to(device)) if device.type == "cuda" else MultiScaleCrossViewFusion(stages=4, dim=128, pe_feats=32, heads=4).to(device)
+    latent = torch.nn.DataParallel(LatentProcessingModule(seq_len=args.clip_len).to(device)) if device.type == "cuda" else LatentProcessingModule(seq_len=args.clip_len).to(device)
+    decoder = torch.nn.DataParallel(Decoder(mano_path).to(device)) if device.type == "cuda" else Decoder(mano_path).to(device)
     front_teacher = None
     student_proj = None
-    if use_front_teacher:
-        front_teacher = torch.nn.DataParallel(FrontCameraTeacher(in_chans=front_in_chans, max_cameras=front_max_cameras).to(device))
-        student_proj = torch.nn.DataParallel(StudentTeacherProjection().to(device))
+    if args.train_mode == "student":
+        ckpt = torch.load(args.teacher_ckpt, map_location=device)
+        front_teacher = FrontCameraTeacher(in_chans=front_in_chans, max_cameras=front_max_cameras).to(device)
+        front_teacher.load_state_dict(ckpt["front_teacher"])
+        front_teacher.eval()
+        front_teacher.requires_grad_(False)
+        student_proj = StudentTeacherProjection().to(device)
+        if device.type == "cuda":
+            front_teacher = torch.nn.DataParallel(front_teacher)
+            student_proj = torch.nn.DataParallel(student_proj)
+        print(f"Loaded frozen front teacher from {args.teacher_ckpt}")
 
     train_modules = [m for m in (dual_swin, fusion, latent, decoder, front_teacher, student_proj) if m is not None]
-    params = [p for m in train_modules for p in m.parameters()]
+    train_modules = [m for m in train_modules if m is not front_teacher]
+    params = [p for m in train_modules for p in m.parameters() if p.requires_grad]
     optimizer = Adam(params, lr=lr)
     loss_module = StructureLatentLoss(lambda_dyn=1.0, lambda_gate=lambda_gate)
     distill_loss_module = TeacherDistillationLoss()
@@ -314,7 +464,7 @@ def main():
 
     global_step = 0
     best_mpjpe = float("inf")
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(1, args.num_epochs + 1):
         print(f"\n=== Epoch {epoch} ===")
         mean_mpjpe, global_step = train_one_epoch(
             train_loader, device, dual_swin, fusion, latent, decoder, front_teacher, student_proj,
@@ -334,6 +484,8 @@ def main():
             best_mpjpe = res["MPJPE"]
             torch.save(ckpt, os.path.join(save_dir, "EgoSSA_best.pth"))
             print(f"New best val MPJPE {best_mpjpe:.2f} (epoch {epoch})")
+        if args.smoke:
+            break
     print(f"Best val MPJPE: {best_mpjpe:.2f}")
 
 
