@@ -85,7 +85,19 @@ python main.py \
   --smoke
 ```
 
-The loader is intentionally conservative: it aligns ZED image files and keypoint files by frame id parsed from filenames, supports one or more front views, and detects whether keypoints are 2D or 3D from the actual tensor shape. It does not fabricate 3D labels from 2D keypoints and does not fabricate ego/front pairing.
+Detected ASLHand2 structure on `dragon.cs.binghamton.edu` for `Abdul_03_52`:
+
+- keypoints: `hand_keypoints_synced/Abdul_03_52/keypoints_label/segment_XXXX.json`
+- videos: `ZED_Segments/Abdul_03_52/left/left_segment_XXXX.mp4` and `right/right_segment_XXXX.mp4`
+- views: two synchronized ZED front views (`left`, `right`)
+- video format: mp4, observed 1280x720 at 60 fps
+- keypoints: JSON `frames[]`, each frame has `frame`, `timestamp_ms`, and `hands.left/right`
+- keypoint shape used by the loader: `[T, 21, 3]` per hand
+- keypoint unit: millimeter-scale 3D coordinates, inferred from values around 1000-1300 on the depth axis
+- synchronization: segment id aligns JSON with left/right mp4; per-frame timestamps are mapped into the segment video duration
+- `PALM_CENTER` exists in JSON but is excluded so the model uses the standard 21 hand joints
+
+The loader does not fabricate ego/front pairing. Student distillation still requires batches that actually contain both stereo fields and front fields. If a stereo batch has no front fields, it falls back to the original AIM1 loss for that batch.
 
 Student mode requires batches that actually contain both stereo fields and front fields. If a stereo batch has no front fields, it falls back to the original AIM1 loss for that batch.
 
