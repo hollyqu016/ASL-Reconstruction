@@ -1,104 +1,97 @@
-# EgoSSA baseline (HOT3D)
+# EgoSSA / AIM2 unpaired baseline
 
-## Setup
+This repository now keeps the original ego-stereo reconstruction path and adds a first AIM2 baseline that matches the actual datasets.
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/pip install setuptools wheel
-.venv/bin/pip install --no-build-isolation chumpy==0.70
-sed -i 's/inspect.getargspec(/inspect.getfullargspec(/' .venv/lib/python3.11/site-packages/chumpy/ch.py
-```
+## Dataset roles
 
-MANO models (`MANO_LEFT.pkl`, `MANO_RIGHT.pkl`) are expected in `/mnt/bigdata/data/body_models/mano` (override with `MANO_PATH`).
+- **ASLHand2**: egocentric ZED stereo. `ZED_Segments/<sequence>/left` and `right` are the two ego cameras. `hand_keypoints_synced/<sequence>/keypoints_label/segment_*.json` provides synchronized 3D hand keypoints for those segments.
+- **ASL Repair**: independent frontal webcam repair videos. `manifest.csv`, `items.csv`, and `ground_truth.json` describe clip-level references, conditions, and message/gloss prompts. They are not frame-level pose ground truth.
+- **HOT3D**: remains supported by `--train_mode baseline`, but the inspected HOT3D data only contains head-mounted egocentric views, not true external front cameras.
 
-## Data
+The implementation does **not** perform frame-level front-to-ego distillation, because ASLHand2 and ASL Repair are not synchronized recordings of the same performance.
 
-Download the full HOT3D-Clips dataset from `bop-benchmark/hot3d` on Hugging Face, then convert:
+## AIM2 V1 training modes
 
 ```bash
-.venv/bin/python tools/convert_hot3d_clips.py --input data/hot3d_raw/train_aria/{...}.tar --output-dir data/hot3d_wds/train
-.venv/bin/python tools/convert_hot3d_clips.py --input data/hot3d_raw/train_aria/{...}.tar --output-dir data/hot3d_wds/val
-.venv/bin/python tools/convert_hot3d_clips.py --input data/hot3d_raw/train_aria/{...}.tar --output-dir data/hot3d_wds/test
-```
-
-## Train / evaluate
-
-```bash
-CUDA_VISIBLE_DEVICES=0 NUM_EPOCHS=3 .venv/bin/python main.py
-.venv/bin/python tools/pose.py
-```
-
-Environment variables: `DATA_TRAIN`, `DATA_VAL`, `MANO_PATH`, `LOG_DIR`, `SAVE_DIR`, `NUM_EPOCHS`, `BATCH_SIZE`, `NUM_WORKERS`, `STRIDE`, `CROP_HANDS`.
-
-## Privileged front-teacher MVP
-
-The training script supports three modes:
-
-```bash
+python main.py --train_mode pose
+python main.py --train_mode ego --pose_ckpt checkpoints/pose_autoencoder_best.pth
+python main.py --train_mode front
+python main.py --train_mode joint_unpaired --pose_ckpt checkpoints/pose_autoencoder_best.pth
 python main.py --train_mode baseline
-python main.py --train_mode teacher --smoke
-python main.py --train_mode student --teacher_ckpt checkpoints/front_teacher_best.pth
 ```
 
-`baseline` preserves the original stereo EgoSSA/AIM1 behavior. `teacher` trains only the front-camera teacher and its pose head. `student` freezes a trained front teacher and adds latent distillation only when a batch contains paired front RGB and ego stereo.
+### `pose`
 
-Expected optional WebDataset fields per frame:
-
-- `camera-front-{0..N}.png` / `front-{0..N}.png` / `front_camera_{0..N}.png`: synchronized front-view RGB images.
-- `meta.json` optional entries: `front_camera_ids`, `front_view_confidence`, `front_intrinsics`, `front_extrinsics`.
-- Optional 2D supervision for multi-camera DLT pseudo-labels: `front_right_keypoints_2d.npy`, `front_left_keypoints_2d.npy`, plus optional `front_right_keypoint_confidence.npy` and `front_left_keypoint_confidence.npy`.
-- Optional precomputed 3D pseudo-labels: `front_pseudo_right_landmarks.npy`, `front_pseudo_left_landmarks.npy`.
-
-The teacher uses a shared Swin Transformer / Swin-FPN encoder for all front cameras, camera embeddings, and confidence-aware view attention to produce a fused teacher representation. A `TeacherPoseHead` predicts synchronized left/right keypoints directly from the teacher representation:
+Trains a pose autoencoder on ASLHand2 3D joints:
 
 ```text
-front RGB -> FrontCameraTeacher -> teacher_repr -> TeacherPoseHead -> keypoints
+ASLHand2 3D joints -> PoseEncoder -> z_pose [B,T,256] -> PoseDecoder -> reconstructed joints
 ```
 
-Teacher loss is supervised against real synchronized keypoints:
+Losses:
+
+- SmoothL1 joint reconstruction.
+- Optional temporal velocity reconstruction.
+
+### `ego`
+
+Trains ego-stereo reconstruction on ASLHand2:
 
 ```text
-L_teacher = L_teacher_pose + LAMBDA_VELOCITY * L_velocity
+ASLHand2 ego left/right -> AIM1/EgoSSA -> z_ego -> MANO decoder -> 3D hands
 ```
 
-Student distillation is:
+If a pose autoencoder checkpoint exists, this also aligns:
 
 ```text
-L_distill = SmoothL1(StudentProjectionHead(student_latent), stopgrad(teacher_repr))
+StudentProjection(z_ego) -> stopgrad(PoseEncoder(GT joints))
 ```
 
-Other front-teacher environment variables: `FRONT_IMG_SIZE`, `FRONT_IN_CHANS`, `FRONT_MAX_CAMERAS`.
+This alignment is valid because both terms come from the same ASLHand2 synchronized ego/keypoint sample.
 
-### ASLHand2 front teacher
+### `front`
 
-Defaults:
+Trains the unpaired ASL Repair frontal branch:
+
+```text
+ASL Repair front video -> FrontVideoEncoder -> z_front_clip [B,256] -> item_id classifier
+```
+
+This is a clip-level semantic/gesture objective. It does not use frame-level gloss or pose labels.
+
+### `joint_unpaired`
+
+Alternates ASLHand2 ego batches and ASL Repair front batches in the same optimization loop:
+
+- ASLHand2: 3D pose supervision plus optional pose-latent alignment.
+- ASL Repair: clip-level `item_id` classification.
+
+It does not zip arbitrary ASLHand2 and ASL Repair samples as if they were paired.
+
+## Dataset paths on dragon
 
 ```bash
-python main.py \
-  --train_mode teacher \
+python main.py --train_mode pose \
   --aslhand2_keypoint_root /home/jqu11/bigdata/data/ASLHand2/hand_keypoints_synced \
   --aslhand2_zed_root /home/jqu11/bigdata/data/ASLHand2/ZED_Segments \
   --aslhand2_sequence Abdul_03_52 \
-  --batch_size 1 \
-  --clip_len 4 \
-  --smoke
+  --batch_size 1 --clip_len 4 --smoke
+
+python main.py --train_mode front \
+  --asl_repair_root /home/jqu11/bigdata/data/ASL_Repair_Videos_2026-09-08 \
+  --batch_size 1 --front_clip_len 8 --smoke
 ```
 
-Detected ASLHand2 structure on `dragon.cs.binghamton.edu` for `Abdul_03_52`:
+## Files added
 
-- keypoints: `hand_keypoints_synced/Abdul_03_52/keypoints_label/segment_XXXX.json`
-- videos: `ZED_Segments/Abdul_03_52/left/left_segment_XXXX.mp4` and `right/right_segment_XXXX.mp4`
-- views: two synchronized ZED front views (`left`, `right`)
-- video format: mp4, observed 1280x720 at 60 fps
-- keypoints: JSON `frames[]`, each frame has `frame`, `timestamp_ms`, and `hands.left/right`
-- keypoint shape used by the loader: `[T, 21, 3]` per hand
-- keypoint unit: millimeter-scale 3D coordinates, inferred from values around 1000-1300 on the depth axis
-- synchronization: segment id aligns JSON with left/right mp4; per-frame timestamps are mapped into the segment video duration
-- `PALM_CENTER` exists in JSON but is excluded so the model uses the standard 21 hand joints
+- `datasets/aslhand2.py`: ASLHand2 ego-stereo/keypoint loader.
+- `datasets/asl_repair.py`: ASL Repair frontal video/metadata loader.
+- `models/privileged/pose_encoder.py`: pose encoder/decoder autoencoder.
+- `models/privileged/front_video_encoder.py`: front clip encoder.
+- `models/privileged/shared_projector.py`: ego-to-pose projection and shared projection utilities.
 
-The loader does not fabricate ego/front pairing. Student distillation still requires batches that actually contain both stereo fields and front fields. If a stereo batch has no front fields, it falls back to the original AIM1 loss for that batch.
+## Current limitations
 
-Student mode requires batches that actually contain both stereo fields and front fields. If a stereo batch has no front fields, it falls back to the original AIM1 loss for that batch.
-
-Metrics are wrist-relative, in mm, over 20 joints: MPJPE, PA-MPJPE, PCK@5, PCK@10, AUC@30.
+- ASLHand2 camera calibration was not found in the inspected segment JSON/video triplets, so the ASLHand2 loader emits a conservative placeholder stereo calibration for EgoSSA's epipolar module. Replace this with real ZED calibration if available.
+- Exact normalized label overlap between inspected ASLHand2 segment `sentence` fields and ASL Repair `item_id`/English/gloss/reference fields was 0, so prototype-level cross-dataset class alignment is disabled in V1.
+- ASL Repair `ground_truth.json` is treated as reference metadata, not pose or frame-level annotation.

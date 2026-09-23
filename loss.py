@@ -44,3 +44,20 @@ class TeacherDistillationLoss(nn.Module):
         if self.mode == "mse":
             return F.mse_loss(student_repr, teacher_repr)
         return F.smooth_l1_loss(student_repr, teacher_repr)
+
+
+class PoseAutoencoderLoss(nn.Module):
+    def __init__(self, lambda_velocity=0.05):
+        super().__init__()
+        self.lambda_velocity = lambda_velocity
+
+    def forward(self, pred, target):
+        recon = F.smooth_l1_loss(pred, target)
+        if pred.shape[1] > 1:
+            pred_vel = pred[:, 1:] - pred[:, :-1]
+            target_vel = target[:, 1:] - target[:, :-1]
+            velocity = F.smooth_l1_loss(pred_vel, target_vel)
+        else:
+            velocity = pred.new_tensor(0.0)
+        total = recon + self.lambda_velocity * velocity
+        return total, {"pose_recon": recon.item(), "pose_velocity": velocity.item()}
