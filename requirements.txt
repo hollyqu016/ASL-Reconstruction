@@ -8,3 +8,4 @@ numpy==1.26.4
 pillow==12.3.0
 tensorboard==2.21.0
 tqdm==4.70.1
+av==13.1.0

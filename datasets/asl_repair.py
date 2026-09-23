@@ -16,7 +16,7 @@ class ASLRepairFrontVideoDataset(Dataset):
     clips and metadata for clip-level semantic/gesture objectives only.
     """
 
-    def __init__(self, root, clip_len=16, image_size=224, split=None, max_samples=None):
+    def __init__(self, root, clip_len=16, image_size=224, split=None, participants=None, split_ratios=(0.7, 0.15, 0.15), max_samples=None):
         self.root = Path(root)
         self.clip_len = clip_len
         self.image_size = image_size
@@ -24,15 +24,18 @@ class ASLRepairFrontVideoDataset(Dataset):
             raise FileNotFoundError(f"ASL Repair root not found: {self.root}")
 
         self.item_metadata = self._load_items()
-        self.samples = self._load_manifest(split)
+        all_samples = self._load_manifest()
+        all_item_ids = sorted({s["item_id"] for s in all_samples if s.get("item_id")})
+        self.item_to_idx = {item_id: i for i, item_id in enumerate(all_item_ids)}
+        selected_participants = _select_participants([s["participant_id"] for s in all_samples], participants, split, split_ratios)
+        self.participants = selected_participants
+        self.samples = [s for s in all_samples if s["participant_id"] in set(selected_participants)]
         if max_samples:
             self.samples = self.samples[:max_samples]
         if not self.samples:
             raise RuntimeError(f"No ASL Repair videos found under {self.root}")
 
-        item_ids = sorted({s["item_id"] for s in self.samples if s.get("item_id")})
-        self.item_to_idx = {item_id: i for i, item_id in enumerate(item_ids)}
-        print(f"ASL Repair front videos: {len(self.samples)} clips, {len(self.item_to_idx)} item classes.")
+        print(f"ASL Repair {split or 'custom'}: {len(self.samples)} clips, {len(self.item_to_idx)} item classes, participants={self.participants}.")
 
     def _load_items(self):
         items = {}
@@ -46,7 +49,7 @@ class ASLRepairFrontVideoDataset(Dataset):
                     items[item_id] = row
         return items
 
-    def _load_manifest(self, split):
+    def _load_manifest(self):
         manifest = self.root / "manifest.csv"
         if manifest.exists():
             rows = []
@@ -54,8 +57,6 @@ class ASLRepairFrontVideoDataset(Dataset):
                 for row in csv.DictReader(f):
                     video_rel = _first_present(row, ("path", "video_path", "filepath", "file"))
                     if not video_rel:
-                        continue
-                    if split and row.get("split") and row["split"] != split:
                         continue
                     path = self.root / video_rel
                     if path.exists():
@@ -112,6 +113,27 @@ def _first_present(row, names):
         if value:
             return value
     return ""
+
+
+def _select_participants(participant_values, participants=None, split=None, split_ratios=(0.7, 0.15, 0.15)):
+    all_participants = sorted({p for p in participant_values if p})
+    if participants:
+        requested = [p.strip() for p in str(participants).split(",") if p.strip()]
+        all_participants = [p for p in all_participants if p in set(requested)]
+    if not split:
+        return all_participants
+    n = len(all_participants)
+    n_train = max(1, int(round(n * split_ratios[0]))) if n else 0
+    n_val = max(1, int(round(n * split_ratios[1]))) if n >= 3 else max(0, n - n_train)
+    if n_train + n_val >= n and n > 1:
+        n_val = 1
+        n_train = max(1, n - 2)
+    splits = {
+        "train": all_participants[:n_train],
+        "val": all_participants[n_train:n_train + n_val],
+        "test": all_participants[n_train + n_val:],
+    }
+    return splits[split]
 
 
 def _read_clip(path, clip_len, image_size):

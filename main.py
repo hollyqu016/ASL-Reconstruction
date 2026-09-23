@@ -2,6 +2,7 @@ import argparse
 import glob
 import os
 import random
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from datasets.asl_repair import ASLRepairFrontVideoDataset, default_asl_repair_root
-from datasets.aslhand2 import ASLHand2EgoStereoDataset, default_aslhand2_roots
+from datasets.aslhand2 import ASLHand2EgoStereoDataset, default_aslhand2_roots, discover_aslhand2_sequences, participant_split
 from datasets.hot3d import StructSyncClipDataset
 from evaluator import PoseEvaluator
 from loss import PoseAutoencoderLoss, StructureLatentLoss
@@ -23,6 +24,7 @@ from models.MANODecoder import Decoder
 from models.MultiScaleCrossViewFusion import MultiScaleCrossViewFusion
 from models.mano import WRIST_IDX
 from models.privileged import FrontVideoEncoder, PoseAutoencoder, PoseEncoder, StudentProjectionHead
+from models.privileged.pose_encoder import POSE_REP_DIM, make_bimanual_pose_representation
 
 
 data_tar_train = os.environ.get("DATA_TRAIN", "data/hot3d_wds/train")
@@ -80,7 +82,6 @@ def preprocess_front_video(x):
     x = x.view(B * T, C, H, W)
     if (H, W) != (img_size, img_size):
         x = F.interpolate(x, size=(img_size, img_size), mode="bilinear", align_corners=False)
-    x = (x - IMG_MEAN) / IMG_STD
     return x.view(B, T, C, img_size, img_size)
 
 
@@ -89,6 +90,8 @@ def linear_schedule(step, start, end, num_steps):
 
 
 def build_camera_matrices(batch, device):
+    if "intrinsics_clip" not in batch or "extrinsics_clip" not in batch:
+        return None, None, None, None
     intrinsics_clip, extrinsics_clip = batch["intrinsics_clip"], batch["extrinsics_clip"]
     T, B = len(intrinsics_clip), intrinsics_clip[0]["left"]["fx"].shape[0]
     K_left = torch.zeros(T, B, 3, 3, dtype=torch.float32, device=device)
@@ -145,9 +148,9 @@ def _batched_translation(trans, batch_size, device):
 
 
 def stack_pose_gt(batch, device):
-    left = to_relative(batch["left_landmarks_clip"].to(device).float() / 1000.0)
-    right = to_relative(batch["right_landmarks_clip"].to(device).float() / 1000.0)
-    return torch.stack([left, right], dim=2)
+    left = batch["left_landmarks_clip"].to(device).float() / 1000.0
+    right = batch["right_landmarks_clip"].to(device).float() / 1000.0
+    return make_bimanual_pose_representation(left, right)
 
 
 def forward_ego(batch, device, dual_swin, fusion, latent, decoder):
@@ -182,8 +185,13 @@ def parse_args():
     parser.add_argument("--data_val", default=data_tar_val)
     parser.add_argument("--aslhand2_keypoint_root", default=roots["keypoint_root"])
     parser.add_argument("--aslhand2_zed_root", default=roots["zed_root"])
-    parser.add_argument("--aslhand2_sequence", default=os.environ.get("ASLHAND2_SEQUENCE", "Abdul_03_52"))
+    parser.add_argument("--aslhand2_sequence", default=os.environ.get("ASLHAND2_SEQUENCE", "Abdul_03_52"), help="Single sequence for smoke/debug compatibility.")
+    parser.add_argument("--aslhand2_sequences", default=os.environ.get("ASLHAND2_SEQUENCES", ""), help="Comma-separated explicit sequence list. Empty discovers all.")
+    parser.add_argument("--aslhand2_participants", default=os.environ.get("ASLHAND2_PARTICIPANTS", ""), help="Comma-separated participant allowlist.")
+    parser.add_argument("--max_timestamp_mismatch_ms", type=float, default=float(os.environ.get("MAX_TIMESTAMP_MISMATCH_MS", 50.0)))
+    parser.add_argument("--use_epipolar_geometry", default=os.environ.get("USE_EPIPOLAR_GEOMETRY", "false"))
     parser.add_argument("--asl_repair_root", default=default_asl_repair_root())
+    parser.add_argument("--asl_repair_participants", default=os.environ.get("ASL_REPAIR_PARTICIPANTS", ""))
     parser.add_argument("--pose_ckpt", default=os.path.join(save_dir, "pose_autoencoder_best.pth"))
     parser.add_argument("--num_epochs", type=int, default=num_epochs)
     parser.add_argument("--batch_size", type=int, default=batch_size)
@@ -192,28 +200,72 @@ def parse_args():
     parser.add_argument("--front_clip_len", type=int, default=int(os.environ.get("FRONT_CLIP_LEN", 16)))
     parser.add_argument("--lambda_pose_align", type=float, default=lambda_pose_align)
     parser.add_argument("--lambda_front_cls", type=float, default=lambda_front_cls)
+    parser.add_argument("--freeze_front_backbone", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pretrained_front_backbone", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
 
-def make_aslhand2_loader(args, max_windows=None, shuffle=True):
+def str_to_bool(value):
+    return str(value).lower() in {"1", "true", "yes", "y"}
+
+
+def find_calibration_candidates(*roots):
+    keywords = ("calib", "camera", "intrinsic", "extrinsic", "zed")
+    matches = []
+    for root in roots:
+        root_path = Path(root)
+        if root_path.is_file():
+            root_path = root_path.parent
+        if not root_path.exists():
+            continue
+        for path in root_path.rglob("*"):
+            if path.is_file() and any(k in path.name.lower() for k in keywords):
+                matches.append(str(path))
+                if len(matches) >= 20:
+                    return matches
+    return matches
+
+
+def report_calibration_state(args):
+    candidates = find_calibration_candidates(args.aslhand2_keypoint_root, args.aslhand2_zed_root)
+    if candidates:
+        print("Potential ASLHand2/ZED calibration files found:")
+        for path in candidates[:20]:
+            print(f"  {path}")
+    else:
+        print("No ASLHand2/ZED calibration files found under the configured roots.")
+    if str_to_bool(args.use_epipolar_geometry) and not candidates:
+        raise RuntimeError("Epipolar geometry was requested, but no real calibration file was found. Rerun with --use_epipolar_geometry false.")
+    return candidates
+
+
+def make_aslhand2_loader(args, split="train", max_windows=None, shuffle=True):
+    sequence_ids = args.aslhand2_sequences
+    if args.smoke and not sequence_ids:
+        sequence_ids = args.aslhand2_sequence
     ds = ASLHand2EgoStereoDataset(
         args.aslhand2_keypoint_root,
         args.aslhand2_zed_root,
-        sequence_id=args.aslhand2_sequence,
+        sequence_ids=sequence_ids,
+        participants=args.aslhand2_participants,
+        split=None if args.smoke else split,
         clip_len=args.clip_len,
         stride=stride,
         image_size=img_size,
         max_windows=max_windows,
+        max_timestamp_mismatch_ms=args.max_timestamp_mismatch_ms,
     )
     return DataLoader(ds, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=shuffle), ds
 
 
-def make_repair_loader(args, max_samples=None, shuffle=True):
+def make_repair_loader(args, split="train", max_samples=None, shuffle=True):
     ds = ASLRepairFrontVideoDataset(
         args.asl_repair_root,
         clip_len=args.front_clip_len,
         image_size=img_size,
+        split=None if args.smoke else split,
+        participants=args.asl_repair_participants,
         max_samples=max_samples,
     )
     return DataLoader(ds, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=shuffle), ds
@@ -306,6 +358,21 @@ def train_front_epoch(loader, device, front_encoder, classifier, optimizer, writ
 
 
 @torch.no_grad()
+def run_front_validation_batch(loader, device, front_encoder, classifier):
+    front_encoder.eval()
+    classifier.eval()
+    batch = next(iter(loader))
+    video = preprocess_front_video(batch["front_video"].to(device).float())
+    labels = batch["item_label"].to(device)
+    logits = classifier(front_encoder(video)["z_front_clip"])
+    finite = torch.isfinite(logits).all().item()
+    print(f"Front val batch: video {tuple(video.shape)}, logits {tuple(logits.shape)}, participants={batch['participant_id']}, finite={finite}")
+    if (labels >= 0).any():
+        acc = (logits.argmax(dim=-1)[labels >= 0] == labels[labels >= 0]).float().mean().item()
+        print(f"Front val one-batch acc: {acc:.3f}")
+
+
+@torch.no_grad()
 def run_evaluation(val_loader, device, dual_swin, fusion, latent, decoder, evaluator):
     for m in (dual_swin, fusion, latent, decoder):
         m.eval()
@@ -329,10 +396,12 @@ def load_pose_encoder(args, device):
     return pose_encoder
 
 
-def build_ego_modules(device, seq_len):
+def build_ego_modules(device, seq_len, use_epipolar_geometry):
+    if not use_epipolar_geometry:
+        print("WARNING: real ASLHand2 ZED calibration not available; using geometry-free stereo cross-attention.")
     return (
         maybe_parallel(DualSwinFPN(), device),
-        maybe_parallel(MultiScaleCrossViewFusion(stages=4, dim=128, pe_feats=32, heads=4), device),
+        maybe_parallel(MultiScaleCrossViewFusion(stages=4, dim=128, pe_feats=32, heads=4, use_epipolar_geometry=use_epipolar_geometry), device),
         maybe_parallel(LatentProcessingModule(seq_len=seq_len), device),
         maybe_parallel(Decoder(mano_path), device),
         maybe_parallel(StudentProjectionHead(), device),
@@ -340,7 +409,9 @@ def build_ego_modules(device, seq_len):
 
 
 def run_pose(args, device, writer):
-    loader, _ = make_aslhand2_loader(args, max_windows=2 if args.smoke else None)
+    loader, ds = make_aslhand2_loader(args, split="train", max_windows=2 if args.smoke else None)
+    print(f"Pose AE representation dimension: {POSE_REP_DIM}")
+    print(f"Pose train participants: {ds.participants}; windows={len(ds)}")
     pose_ae = PoseAutoencoder().to(device)
     criterion = PoseAutoencoderLoss()
     optimizer = Adam(pose_ae.parameters(), lr=lr)
@@ -367,11 +438,13 @@ def run_ego(args, device, writer):
         val_loader = DataLoader(val_set, batch_size=args.batch_size, num_workers=min(args.num_workers, n_shards(val_tars)))
         use_pose_align = False
     else:
-        train_loader, _ = make_aslhand2_loader(args, max_windows=2 if args.smoke else None)
-        val_loader = train_loader
+        train_loader, train_ds = make_aslhand2_loader(args, split="train", max_windows=2 if args.smoke else None)
+        val_loader, val_ds = make_aslhand2_loader(args, split="val", max_windows=1 if args.smoke else None, shuffle=False)
+        print(f"ASLHand2 train participants: {train_ds.participants}; windows={len(train_ds)}")
+        print(f"ASLHand2 val participants: {val_ds.participants}; windows={len(val_ds)}")
         use_pose_align = True
 
-    modules = build_ego_modules(device, args.clip_len)
+    modules = build_ego_modules(device, args.clip_len, str_to_bool(args.use_epipolar_geometry))
     pose_encoder = load_pose_encoder(args, device) if use_pose_align else None
     optimizer = Adam([p for m in modules for p in m.parameters() if p.requires_grad], lr=lr)
     evaluator = PoseEvaluator()
@@ -401,13 +474,17 @@ def run_ego(args, device, writer):
 
 
 def run_front(args, device, writer):
-    loader, ds = make_repair_loader(args, max_samples=2 if args.smoke else None)
-    front_encoder = FrontVideoEncoder().to(device)
+    loader, ds = make_repair_loader(args, split="train", max_samples=2 if args.smoke else None)
+    val_loader, val_ds = make_repair_loader(args, split="val", max_samples=1 if args.smoke else None, shuffle=False)
+    print(f"ASL Repair train participants: {ds.participants}; clips={len(ds)}")
+    print(f"ASL Repair val participants: {val_ds.participants}; clips={len(val_ds)}")
+    front_encoder = FrontVideoEncoder(pretrained_backbone=args.pretrained_front_backbone, freeze_backbone=args.freeze_front_backbone).to(device)
     classifier = nn.Linear(256, max(len(ds.item_to_idx), 1)).to(device)
     optimizer = Adam(list(front_encoder.parameters()) + list(classifier.parameters()), lr=lr)
     global_step = 0
     for epoch in range(1, args.num_epochs + 1):
         loss, acc, global_step = train_front_epoch(loader, device, front_encoder, classifier, optimizer, writer, global_step)
+        run_front_validation_batch(val_loader, device, front_encoder, classifier)
         torch.save({"epoch": epoch, "front_encoder": front_encoder.state_dict(), "front_classifier": classifier.state_dict(), "item_to_idx": ds.item_to_idx}, os.path.join(save_dir, "front_semantic_last.pth"))
         print(f"Front epoch {epoch}: cls_loss={loss:.4f}, acc={acc:.3f}")
         if args.smoke:
@@ -415,11 +492,13 @@ def run_front(args, device, writer):
 
 
 def run_joint_unpaired(args, device, writer):
-    ego_loader, _ = make_aslhand2_loader(args, max_windows=2 if args.smoke else None)
-    front_loader, repair_ds = make_repair_loader(args, max_samples=2 if args.smoke else None)
-    modules = build_ego_modules(device, args.clip_len)
+    ego_loader, ego_ds = make_aslhand2_loader(args, split="train", max_windows=2 if args.smoke else None)
+    front_loader, repair_ds = make_repair_loader(args, split="train", max_samples=2 if args.smoke else None)
+    print(f"Joint ASLHand2 train participants: {ego_ds.participants}; windows={len(ego_ds)}")
+    print(f"Joint ASL Repair train participants: {repair_ds.participants}; clips={len(repair_ds)}")
+    modules = build_ego_modules(device, args.clip_len, str_to_bool(args.use_epipolar_geometry))
     pose_encoder = load_pose_encoder(args, device)
-    front_encoder = FrontVideoEncoder().to(device)
+    front_encoder = FrontVideoEncoder(pretrained_backbone=args.pretrained_front_backbone, freeze_backbone=args.freeze_front_backbone).to(device)
     classifier = nn.Linear(256, max(len(repair_ds.item_to_idx), 1)).to(device)
     params = [p for m in modules for p in m.parameters() if p.requires_grad] + list(front_encoder.parameters()) + list(classifier.parameters())
     optimizer = Adam(params, lr=lr)
@@ -491,6 +570,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(save_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
+    if args.train_mode in ("pose", "ego", "joint_unpaired"):
+        report_calibration_state(args)
     if args.train_mode == "pose":
         run_pose(args, device, writer)
     elif args.train_mode in ("baseline", "ego"):

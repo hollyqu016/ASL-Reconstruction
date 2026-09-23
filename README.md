@@ -22,10 +22,10 @@ python main.py --train_mode baseline
 
 ### `pose`
 
-Trains a pose autoencoder on ASLHand2 3D joints:
+Trains a pose autoencoder on ASLHand2 3D joints. The pose representation preserves bimanual layout:
 
 ```text
-ASLHand2 3D joints -> PoseEncoder -> z_pose [B,T,256] -> PoseDecoder -> reconstructed joints
+[left local hand, right local hand, right_wrist - left_wrist] -> PoseEncoder -> z_pose [B,T,256]
 ```
 
 Losses:
@@ -75,12 +75,25 @@ python main.py --train_mode pose \
   --aslhand2_keypoint_root /home/jqu11/bigdata/data/ASLHand2/hand_keypoints_synced \
   --aslhand2_zed_root /home/jqu11/bigdata/data/ASLHand2/ZED_Segments \
   --aslhand2_sequence Abdul_03_52 \
-  --batch_size 1 --clip_len 4 --smoke
+  --batch_size 1 --clip_len 4 --use_epipolar_geometry false --smoke
+
+python main.py --train_mode ego \
+  --aslhand2_keypoint_root /home/jqu11/bigdata/data/ASLHand2/hand_keypoints_synced \
+  --aslhand2_zed_root /home/jqu11/bigdata/data/ASLHand2/ZED_Segments \
+  --batch_size 1 --clip_len 4 --use_epipolar_geometry false --smoke
 
 python main.py --train_mode front \
   --asl_repair_root /home/jqu11/bigdata/data/ASL_Repair_Videos_2026-09-08 \
   --batch_size 1 --front_clip_len 8 --smoke
+
+python main.py --train_mode joint_unpaired \
+  --aslhand2_keypoint_root /home/jqu11/bigdata/data/ASLHand2/hand_keypoints_synced \
+  --aslhand2_zed_root /home/jqu11/bigdata/data/ASLHand2/ZED_Segments \
+  --asl_repair_root /home/jqu11/bigdata/data/ASL_Repair_Videos_2026-09-08 \
+  --batch_size 1 --clip_len 4 --front_clip_len 8 --use_epipolar_geometry false --smoke
 ```
+
+ASLHand2 and ASL Repair now use participant-independent train/val/test splits by default. `--smoke` preserves single-sequence debug behavior through `--aslhand2_sequence`.
 
 ## Files added
 
@@ -92,6 +105,12 @@ python main.py --train_mode front \
 
 ## Current limitations
 
-- ASLHand2 camera calibration was not found in the inspected segment JSON/video triplets, so the ASLHand2 loader emits a conservative placeholder stereo calibration for EgoSSA's epipolar module. Replace this with real ZED calibration if available.
+- ASLHand2 camera calibration was not found under the inspected roots. The code no longer fabricates intrinsics/baseline. Use `--use_epipolar_geometry false` unless real ZED calibration files are added.
 - Exact normalized label overlap between inspected ASLHand2 segment `sentence` fields and ASL Repair `item_id`/English/gloss/reference fields was 0, so prototype-level cross-dataset class alignment is disabled in V1.
 - ASL Repair `ground_truth.json` is treated as reference metadata, not pose or frame-level annotation.
+
+## Implementation details
+
+- ASLHand2 RGB/keypoint matching decodes actual video frame PTS with PyAV and selects the nearest RGB frame to each keypoint timestamp relative to the segment start. The loader prints mean mismatch, max mismatch, and skipped frame percentage using `--max_timestamp_mismatch_ms`.
+- The front encoder uses torchvision pretrained ResNet18 as the frame backbone, followed by the existing lightweight temporal Transformer. `--freeze_front_backbone` is enabled by default.
+- Legacy paired-data front-teacher distillation loss has been removed from active code. V1 never applies `L(z_ego, z_front)` across arbitrary ASLHand2 and ASL Repair samples.

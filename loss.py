@@ -32,20 +32,6 @@ class StructureLatentLoss(nn.Module):
         return kl.sum(-1).mean()
 
 
-class TeacherDistillationLoss(nn.Module):
-    def __init__(self, mode="smooth_l1"):
-        super().__init__()
-        self.mode = mode
-
-    def forward(self, student_repr, teacher_repr):
-        teacher_repr = teacher_repr.detach()
-        if self.mode == "cosine":
-            return 1.0 - F.cosine_similarity(student_repr, teacher_repr, dim=-1).mean()
-        if self.mode == "mse":
-            return F.mse_loss(student_repr, teacher_repr)
-        return F.smooth_l1_loss(student_repr, teacher_repr)
-
-
 class PoseAutoencoderLoss(nn.Module):
     def __init__(self, lambda_velocity=0.05):
         super().__init__()

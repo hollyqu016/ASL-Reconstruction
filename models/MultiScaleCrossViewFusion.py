@@ -36,20 +36,25 @@ class CrossViewDeformableAttention(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.pe_proj = nn.Linear(pe_dim, dim)
 
-    def forward(self, lf, rf, pe):
+    def forward(self, lf, rf, pe=None):
         B, T, C, H, W = lf.shape
         N = H * W
         q = lf.reshape(B * T, C, N).transpose(1, 2)
         k = rf.reshape(B * T, C, N).transpose(1, 2)
-        pe_mapped = self.pe_proj(pe.reshape(B * T, N, -1))
-        attn_out, _ = self.attn(q + pe_mapped, k + pe_mapped, k)
+        if pe is not None:
+            pe_mapped = self.pe_proj(pe.reshape(B * T, N, -1))
+            q_in, k_in = q + pe_mapped, k + pe_mapped
+        else:
+            q_in, k_in = q, k
+        attn_out, _ = self.attn(q_in, k_in, k)
         out = self.norm(attn_out + q)
         return out.transpose(1, 2).reshape(B, T, C, H, W)
 
 
 class MultiScaleCrossViewFusion(nn.Module):
-    def __init__(self, stages=4, dim=128, pe_feats=32, heads=4):
+    def __init__(self, stages=4, dim=128, pe_feats=32, heads=4, use_epipolar_geometry=True):
         super().__init__()
+        self.use_epipolar_geometry = use_epipolar_geometry
         self.pe_modules = nn.ModuleList([EpiPositionalEncoding(pe_feats) for _ in range(stages)])
         pe_dim = 3 * 2 * pe_feats
         self.attn_modules = nn.ModuleList([CrossViewDeformableAttention(dim, pe_dim, heads) for _ in range(stages)])
@@ -58,10 +63,14 @@ class MultiScaleCrossViewFusion(nn.Module):
         fused = []
         for i, (lf, rf) in enumerate(zip(left_feats, right_feats)):
             B, T, C, H, W = lf.shape
-            grid = F.affine_grid(
-                torch.eye(2, 3, device=lf.device).unsqueeze(0).repeat(B * T, 1, 1),
-                size=(B * T, C, H, W), align_corners=False
-            ).view(B, T, H, W, 2)
-            pe = self.pe_modules[i](grid, K, K_inv, T_lr)
+            pe = None
+            if self.use_epipolar_geometry:
+                if K is None or K_inv is None or T_lr is None:
+                    raise ValueError("Epipolar fusion requires real camera calibration. Use --use_epipolar_geometry false when calibration is unavailable.")
+                grid = F.affine_grid(
+                    torch.eye(2, 3, device=lf.device).unsqueeze(0).repeat(B * T, 1, 1),
+                    size=(B * T, C, H, W), align_corners=False
+                ).view(B, T, H, W, 2)
+                pe = self.pe_modules[i](grid, K, K_inv, T_lr)
             fused.append(self.attn_modules[i](lf, rf, pe))
         return fused
